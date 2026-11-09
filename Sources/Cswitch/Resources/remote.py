@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -131,6 +132,35 @@ def atomic_write(path, raw):
             os.unlink(temp)
 
 
+def claude_output(executable, arguments, timeout):
+    environment = dict(os.environ)
+    environment["PATH"] = os.pathsep.join([str(ROOT / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin", environment.get("PATH", "")])
+    environment.update({"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "NO_COLOR": "1"})
+    try:
+        result = subprocess.run([executable, *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=timeout, env=environment, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout[:65536].decode("utf-8", "replace")
+
+
+def claude_login(executable):
+    """Ask Claude Code which login it uses. Only account metadata is returned."""
+    output = claude_output(executable, ["--version"], 5)
+    version = output.split()[0] if output and output.split() and output.split()[0][:1].isdigit() else None
+    # Older releases have no auth command and would treat it as a prompt.
+    if "auth status" not in (claude_output(executable, ["auth", "status", "--help"], 5) or ""):
+        return None, version
+    try:
+        value = json.loads(claude_output(executable, ["auth", "status", "--json"], 8) or "")
+    except ValueError:
+        return None, version
+    if not isinstance(value, dict) or not isinstance(value.get("loggedIn"), bool):
+        return None, version
+    keys = ("loggedIn", "authMethod", "email", "orgId", "orgName", "subscriptionType")
+    return {key: value[key] for key in keys if isinstance(value.get(key), (str, bool))}, version
+
+
 def run(request):
     if platform.system() != "Linux":
         raise ValueError("Remote devices currently support Linux over SSH.")
@@ -150,7 +180,8 @@ def run(request):
                 if candidate.is_file() and os.access(candidate, os.X_OK):
                     executable = str(candidate)
                     break
-        return {"identity": account, "claudePath": executable}
+        login, version = claude_login(executable) if executable else (None, None)
+        return {"identity": account, "claudePath": executable, "login": login, "version": version}
     if operation == "capture":
         with locks():
             *_, secret, fingerprint = snapshot()
@@ -163,6 +194,7 @@ def run(request):
                 raise ValueError("Claude changed its login while switching. Nothing was changed; retry.")
             _, config_path, credential_path = paths()
             config["oauthAccount"] = secret["identity"]
+            config.pop("cachedUsageUtilization", None)
             credentials["claudeAiOauth"] = secret["oauth"]
             atomic_write(credential_path, json.dumps(credentials).encode())
             try:

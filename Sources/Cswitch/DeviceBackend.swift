@@ -10,7 +10,13 @@ struct Capture: Sendable {
 
 struct DeviceBackend {
     let home: URL
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser) { self.home = home }
+    let keychain: any ClaudeKeychainAccess
+    let writeFile: @Sendable (Data, URL) throws -> Void
+    init(home: URL = FileManager.default.homeDirectoryForCurrentUser,
+         keychain: any ClaudeKeychainAccess = ClaudeKeychain(),
+         writeFile: @escaping @Sendable (Data, URL) throws -> Void = { try privateWrite($0, to: $1) }) {
+        self.home = home; self.keychain = keychain; self.writeFile = writeFile
+    }
     var directory: URL { home.appendingPathComponent(".claude", isDirectory: true) }
     var credentialFile: URL { directory.appendingPathComponent(".credentials.json") }
     var settingsFile: URL { directory.appendingPathComponent("settings.json") }
@@ -23,19 +29,22 @@ struct DeviceBackend {
     func status(_ device: Device) throws -> DeviceStatus {
         if device.sshHost != nil {
             let result = try remote(device, request: .object(["operation": .string("status")]))
-            return DeviceStatus(identity: result["identity"].flatMap { try? AccountIdentity(json: $0) }, claudePath: result["claudePath"]?.string)
+            return DeviceStatus(identity: result["identity"].flatMap { try? AccountIdentity(json: $0) }, claudePath: result["claudePath"]?.string,
+                                login: result["login"].flatMap { ClaudeLogin(status: $0) }, version: result["version"]?.string)
         }
         let configuration = try JSONValue.decode(readFile(config))
         let credentials = try? JSONValue.decode(readFile(credentialFile))
         let settings = try JSONValue.decode(readFile(settingsFile))
-        // This is the account selected in the credential files, not a probe of a
-        // running CLI or Keychain. An old token override needs an explicit switch
-        // before we can report that the file login has been selected.
+        // Configured identity is display metadata, not proof of token ownership.
         let tokenOverride = settings["env"]?["CLAUDE_CODE_OAUTH_TOKEN"]
         let secret = credentials.flatMap { try? AccountMutation.secret(configuration: configuration, credentials: $0) }
         let identity = tokenOverride == nil ? try secret?.account : nil
         let configuredIdentity = tokenOverride == nil ? configuration["oauthAccount"].flatMap { try? AccountIdentity(json: $0) } : nil
-        return DeviceStatus(identity: identity, claudePath: findClaude(), configuredIdentity: configuredIdentity)
+        let path = findClaude()
+        let probe = path.map(ClaudeCLI.probe)
+        return DeviceStatus(identity: identity, claudePath: path, configuredIdentity: configuredIdentity,
+                            login: probe?.login, version: probe?.version,
+                            configuredPlan: secret?.oauth["subscriptionType"]?.string)
     }
 
     func capture(_ device: Device, interactive: Bool) throws -> Capture {
@@ -48,16 +57,18 @@ struct DeviceBackend {
             else { secret = nil }
             return Capture(secret: secret, fingerprint: fingerprint)
         }
+        try requireDefaultProfile()
         return try withLocalLocks {
             let configData = try readFile(config)
             let credentialData = try readFile(credentialFile)
             let settingsData = try readFile(settingsFile)
-            let root = try JSONValue.decode(credentialData)
+            let keychainData = try keychain.read(interactive: interactive)
+            let root = try credentialRoot(keychainData ?? credentialData)
             let secret: AccountSecret?
             if root["claudeAiOauth"] == nil || root["claudeAiOauth"] == .null { secret = nil }
             else { secret = try AccountMutation.secret(configuration: .decode(configData), credentials: root) }
             return Capture(secret: secret,
-                           fingerprint: fingerprint(configData, credentialData, settingsData))
+                           fingerprint: fingerprint(configData, credentialData, settingsData, keychainData))
         }
     }
 
@@ -67,14 +78,18 @@ struct DeviceBackend {
             _ = try remote(device, request: .object(["operation": .string("activate"), "secret": value, "expectedFingerprint": .string(expected)]))
             return
         }
+        try requireDefaultProfile()
         try withLocalLocks {
             let oldConfig = try readFile(config)
             let oldCredentials = try readFile(credentialFile)
             let oldSettings = try readFile(settingsFile)
-            guard fingerprint(oldConfig, oldCredentials, oldSettings) == expected else {
+            let oldKeychain = try keychain.read(interactive: true)
+            guard fingerprint(oldConfig, oldCredentials, oldSettings, oldKeychain) == expected else {
                 throw CswitchError.message("Claude changed its login while switching. Nothing was changed; retry.")
             }
             let updated = try AccountMutation.applying(secret, configuration: .decode(oldConfig), credentials: .decode(oldCredentials))
+            let updatedKeychain = try AccountMutation.applying(secret, configuration: .decode(oldConfig),
+                credentials: credentialRoot(oldKeychain ?? oldCredentials)).credentials.data()
             guard var settings = try JSONValue.decode(oldSettings).object else { throw CswitchError.message("Claude settings must be a JSON object.") }
             if let env = settings["env"], env != .null, env.object == nil {
                 throw CswitchError.message("Claude's env settings are invalid. No changes were made.")
@@ -93,26 +108,52 @@ struct DeviceBackend {
             }
             changes.append((config, oldConfig, try updated.configuration.data()))
             var appliedChanges: [(URL, Data?)] = []
+            var keychainWritten = false
             do {
+                // Fail before touching any files if macOS denies Keychain access.
+                try keychain.write(updatedKeychain)
+                keychainWritten = true
                 for (url, old, new) in changes {
                     let original = FileManager.default.fileExists(atPath: url.path) ? old : nil
-                    try privateWrite(new, to: url)
+                    try writeFile(new, url)
                     appliedChanges.append((url, original))
+                }
+                // A matching email in auth status is insufficient: verify the
+                // full login actually stored in Keychain and the fallback file.
+                let appliedKeychain = try keychain.read(interactive: true)
+                guard let appliedKeychain,
+                      try AccountMutation.secret(configuration: .decode(readFile(config)),
+                          credentials: credentialRoot(appliedKeychain)) == secret,
+                      try AccountMutation.secret(configuration: .decode(readFile(config)),
+                          credentials: .decode(readFile(credentialFile))) == secret,
+                      try JSONValue.decode(readFile(settingsFile))["env"]?["CLAUDE_CODE_OAUTH_TOKEN"] == nil else {
+                    throw CswitchError.message("The selected login could not be verified in Keychain and Claude's files.")
                 }
             } catch {
                 var rollbackFailed = false
                 for (url, original) in appliedChanges.reversed() {
                     do {
-                        if let original { try privateWrite(original, to: url) }
+                        if let original { try writeFile(original, url) }
                         else { try FileManager.default.removeItem(at: url) }
                     } catch { rollbackFailed = true }
                 }
-                throw CswitchError.message(rollbackFailed ? "The file switch could not be rolled back. Reapply the saved account before using Claude Code." : "The switch failed; the original files were restored.")
-            }
-            let applied = try AccountMutation.secret(configuration: .decode(readFile(config)), credentials: .decode(readFile(credentialFile)))
-            let appliedSettings = try JSONValue.decode(readFile(settingsFile))
-            guard applied == secret, appliedSettings["env"]?["CLAUDE_CODE_OAUTH_TOKEN"] == nil else {
-                throw CswitchError.message("The credential files could not be verified. Reapply the saved login and check Claude Code's account.")
+                if keychainWritten {
+                    do {
+                        let current = try keychain.read(interactive: true)
+                        if current != oldKeychain {
+                            guard current == updatedKeychain else {
+                                throw CswitchError.message("Claude changed its Keychain login during rollback.")
+                            }
+                            if let oldKeychain { try keychain.write(oldKeychain) }
+                            else { try keychain.remove() }
+                        }
+                    } catch { rollbackFailed = true }
+                }
+                if rollbackFailed {
+                    throw CswitchError.message("The switch could not be rolled back completely. Reapply the saved account before using Claude Code.")
+                }
+                if !keychainWritten { throw error }
+                throw CswitchError.message("The switch failed; the original Keychain login and files were restored.")
             }
         }
     }
@@ -128,8 +169,25 @@ struct DeviceBackend {
         return try Data(contentsOf: path)
     }
 
-    private func fingerprint(_ config: Data, _ credentials: Data, _ settings: Data) -> String {
-        SHA256.hash(data: config + Data([0]) + credentials + Data([0]) + settings).map { String(format: "%02x", $0) }.joined()
+    private func credentialRoot(_ data: Data) throws -> JSONValue {
+        let root = try JSONValue.decode(data)
+        guard root.object != nil else { throw CswitchError.message("Claude Code's credential storage is invalid. No changes were made.") }
+        return root
+    }
+
+    private func requireDefaultProfile() throws {
+        let environment = ProcessInfo.processInfo.environment
+        // Custom directories use a different Keychain service name. Never write
+        // the default entry when the CLI would actually read another profile.
+        guard environment["CLAUDE_CONFIG_DIR"].map({ $0.isEmpty }) ?? true,
+              environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"].map({ $0.isEmpty }) ?? true else {
+            throw CswitchError.message("Cswitch currently supports Claude's default Mac profile. Unset CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR before switching.")
+        }
+    }
+
+    private func fingerprint(_ config: Data, _ credentials: Data, _ settings: Data, _ keychain: Data?) -> String {
+        let state = [config, credentials, settings].map { $0.base64EncodedString() } + [keychain?.base64EncodedString() ?? "missing"]
+        return SHA256.hash(data: Data(state.joined(separator: "\n").utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func withLocalLocks<T>(_ body: () throws -> T) throws -> T {
@@ -193,14 +251,53 @@ func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of
 
 func findClaude() -> String? {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return [home + "/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    return [home + "/.local/bin/claude", home + "/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
+}
+
+/// Asks the installed Claude Code which login it uses. Claude reads its own
+/// credential store (including the macOS Keychain); Cswitch receives only
+/// account metadata from `claude auth status`, never a token.
+enum ClaudeCLI {
+    struct Probe { var login: ClaudeLogin?; var version: String? }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var supportsStatus: [String: Bool] = [:]
+
+    static func probe(_ path: String) -> Probe {
+        let version = run(path, ["--version"], timeout: 5)
+            .flatMap { $0.split(separator: " ").first.map(String.init) }
+            .flatMap { $0.first?.isNumber == true ? $0 : nil }
+        // Older releases have no auth command and would treat it as a prompt.
+        let key = path + "@" + (version ?? "?")
+        let cached = lock.withLock { supportsStatus[key] }
+        let supported = cached ?? (run(path, ["auth", "status", "--help"], timeout: 5)?.contains("auth status") == true)
+        if cached == nil { lock.withLock { supportsStatus[key] = supported } }
+        guard supported, let output = run(path, ["auth", "status", "--json"], timeout: 8),
+              let json = try? JSONValue.decode(Data(output.utf8)) else { return Probe(login: nil, version: version) }
+        return Probe(login: ClaudeLogin(status: json), version: version)
+    }
+
+    private static func run(_ path: String, _ arguments: [String], timeout: TimeInterval) -> String? {
+        var environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        environment["PATH"] = ([home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] +
+            [environment["PATH"]].compactMap { $0 }).joined(separator: ":")
+        environment["DISABLE_AUTOUPDATER"] = "1"
+        environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        environment["NO_COLOR"] = "1"
+        guard let result = try? Subprocess.run(path, arguments: arguments, environment: environment, timeout: timeout),
+              result.output.count < 65_536 else { return nil }
+        return String(data: result.output, encoding: .utf8)
+    }
 }
 
 enum Subprocess {
     struct Result { var output: Data; var status: Int32 }
-    static func run(_ path: String, arguments: [String], input: Data = Data(), timeout: TimeInterval) throws -> Result {
+    static func run(_ path: String, arguments: [String], input: Data = Data(), environment: [String: String]? = nil,
+                    timeout: TimeInterval) throws -> Result {
         let process = Process(), output = Pipe(), stdin = Pipe()
         process.executableURL = URL(fileURLWithPath: path); process.arguments = arguments
+        if let environment { process.environment = environment }
         process.standardInput = stdin; process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         let ended = DispatchSemaphore(value: 0)

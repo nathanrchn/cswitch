@@ -9,7 +9,8 @@ let package = Package(
         .target(name: "CswitchCore"),
         .executableTarget(name: "Cswitch", dependencies: ["CswitchCore"],
                           resources: [.copy("Resources/remote.py"), .copy("Resources/history.py")]),
-        .testTarget(name: "CswitchCoreTests", dependencies: ["CswitchCore"])
+        .testTarget(name: "CswitchCoreTests", dependencies: ["CswitchCore"]),
+        .testTarget(name: "CswitchBackendTests", dependencies: ["Cswitch", "CswitchCore"])
     ],
     swiftLanguageModes: [.v5]
 )

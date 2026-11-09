@@ -14,6 +14,7 @@ public enum AccountMutation {
         }
         _ = try AccountSecret(oauth: secret.oauth, identity: secret.identity)
         config["oauthAccount"] = secret.identity
+        config.removeValue(forKey: "cachedUsageUtilization")
         creds["claudeAiOauth"] = secret.oauth
         return (.object(config), .object(creds))
     }

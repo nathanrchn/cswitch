@@ -8,8 +8,9 @@ enum Main {
         if let index = CommandLine.arguments.firstIndex(of: "--check-device"), CommandLine.arguments.indices.contains(index + 1) {
             let host = CommandLine.arguments[index + 1]
             do {
-                let status = try DeviceBackend().status(Device(name: host, sshHost: host))
-                print("SSH helper connected. Claude Code: \(status.claudePath == nil ? "not found" : "installed"). Account identity: \(status.identity == nil ? "not signed in" : "present"). No credentials read or changed.")
+                let status = try DeviceBackend().status(host == "local" ? .local : Device(name: host, sshHost: host))
+                let login = status.login.map { $0.loggedIn ? "signed in (\($0.method ?? "unknown method"))" : "signed out" } ?? "unavailable"
+                print("\(host == "local" ? "This Mac" : "SSH helper connected"). Claude Code: \(status.claudePath == nil ? "not found" : "installed \(status.version ?? "")"). Account identity: \(status.identity == nil ? "not signed in" : "present"). Claude reports: \(login). No credentials read or changed.")
             } catch { print(error.localizedDescription); exit(1) }
             return
         }
@@ -36,14 +37,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApplication.shared.terminate(nil)
             return
         }
-        model = AppModel(demo: CommandLine.arguments.contains("--demo"))
+        model = AppModel(demo: CommandLine.arguments.contains("--demo"), mixed: CommandLine.arguments.contains("--mixed"))
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = CswitchIcon.menuBarImage()
         item.button?.target = self; item.button?.action = #selector(toggle)
         item.button?.toolTip = "Cswitch · Claude Code accounts"
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: PanelView(model: model))
+        let panel = NSHostingController(rootView: PanelView(model: model))
+        panel.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = panel
         if !model.demo {
             poller = Task { [weak self] in
                 guard let model = self?.model else { return }
@@ -57,6 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if CommandLine.arguments.contains("--preview") {
             let controller = NSHostingController(rootView: PanelView(model: model))
+            controller.sizingOptions = [.preferredContentSize]
             let window = NSWindow(contentViewController: controller)
             window.title = "Cswitch · Demo"
             window.styleMask = [.titled, .closable]

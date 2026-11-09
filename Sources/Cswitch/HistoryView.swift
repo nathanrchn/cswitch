@@ -4,95 +4,127 @@ import SwiftUI
 struct HistoryView: View {
     let report: HistoryReport
     let loading: Bool
+    @AppStorage("historyExpanded") private var expanded = true
     @State private var period: HistoryPeriod = .week
     @State private var hoveredDate: Date?
 
     var body: some View {
         let totals = report.totals(period)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Token history").font(.system(size: 11, weight: .medium))
-                if loading { ProgressView().controlSize(.mini) }
+        Group {
+            if expanded { details(totals) } else { collapsed(totals) }
+        }
+        .card()
+    }
+
+    private func collapsed(_ totals: TokenTotals) -> some View {
+        Button { withAnimation(.snappy(duration: 0.2)) { expanded = true } } label: {
+            HStack(spacing: 8) {
+                Text("Token usage").font(.system(size: 12, weight: .semibold))
+                if loading { Spinner() }
                 Spacer()
-                Picker("History period", selection: $period) {
-                    ForEach(HistoryPeriod.allCases) { Text($0.rawValue).tag($0) }
-                }.labelsHidden().pickerStyle(.menu).fixedSize().controlSize(.mini)
+                if report.loaded {
+                    Text("\(Self.tokens(totals.total)) · \(period.rawValue)").font(.system(size: 12)).monospacedDigit()
+                        .foregroundStyle(Palette.secondary)
+                }
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Palette.secondary)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 11)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Show token usage")
+    }
+
+    /// Hovering a day shows its numbers in place of the period's, so nothing covers the chart.
+    private func details(_ totals: TokenTotals) -> some View {
+        let shown = hoveredDate.map { report.days[$0] ?? TokenTotals() } ?? totals
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Button { withAnimation(.snappy(duration: 0.2)) { expanded = false } } label: {
+                    HStack(spacing: 6) {
+                        Text("Token usage").font(.system(size: 12, weight: .semibold))
+                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(Palette.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).accessibilityLabel("Hide token usage")
+                if loading { Spinner() }
+                Spacer()
+                PeriodPicker(selection: $period)
             }
             if report.loaded {
-                if period == .all { activityGrid }
-                else { dailyChart(days: period == .week ? 7 : 30) }
-                Text(chartCaption).font(.system(size: 8)).foregroundStyle(.tertiary)
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(Self.tokens(totals.total)).font(.system(size: 16, weight: .medium, design: .rounded)).monospacedDigit()
-                        Text("total tokens, including cache").font(.system(size: 9)).foregroundStyle(.secondary)
-                    }.help("Input \(Self.tokens(totals.input)) · Output \(Self.tokens(totals.output))\nCache read \(Self.tokens(totals.cacheRead)) · Cache write \(Self.tokens(totals.cacheWrite))\n\(totals.requests) unique requests")
+                HStack(alignment: .lastTextBaseline) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Self.tokens(shown.total)).font(.system(size: 22, weight: .semibold)).monospacedDigit()
+                        Text(hoveredDate.map { "tokens on " + $0.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated)) }
+                             ?? "tokens · all devices")
+                            .font(.system(size: 11, weight: hoveredDate == nil ? .regular : .medium))
+                            .foregroundStyle(hoveredDate == nil ? Palette.secondary : Palette.accentText)
+                    }
+                    .help(exactDescription(shown))
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(cost(totals)).font(.system(size: 14, weight: .medium)).monospacedDigit()
-                        Text(totals.unknownModels.isEmpty ? "estimated API cost" : "partial API estimate")
-                            .font(.system(size: 9)).foregroundStyle(.secondary)
-                    }.help(costExplanation(totals))
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(cost(shown)).font(.system(size: 15, weight: .semibold)).monospacedDigit()
+                        Text(shown.unknownModels.isEmpty ? "estimated API cost" : "partial API estimate")
+                            .font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                    }
+                    .help(costExplanation(shown))
                 }
-                tokenBreakdown(totals)
+                if period == .all { activityGrid } else { dailyChart(days: period == .week ? 7 : 30) }
+                tokenBreakdown(shown)
             } else {
                 Text(loading ? "Reading saved Claude Code activity…" : "History is unavailable. Refresh to try again.")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .font(.system(size: 11)).foregroundStyle(Palette.secondary)
             }
             HStack(spacing: 4) {
-                Text("All accounts · \(report.deviceCount) devices")
-                if !report.staleDevices.isEmpty { Text("· cached / incomplete").help("History unavailable or stale on: " + report.staleDevices.joined(separator: ", ")) }
-                if report.unreadable > 0 { Image(systemName: "exclamationmark.triangle").help("Some history records or files could not be read. Totals may be incomplete.") }
-                if report.cacheFailure { Image(systemName: "externaldrive.badge.exclamationmark").help("History was read but its cache could not be saved.") }
-            }.font(.system(size: 9)).foregroundStyle(.secondary)
-        }.padding(.horizontal, 16).padding(.vertical, 12)
-            .overlayPreferenceValue(HistoryHoverPreference.self) { target in
-                GeometryReader { geometry in
-                    if let target, target.date == hoveredDate {
-                        let bounds = geometry[target.bounds]
-                        let width: CGFloat = 260, height: CGFloat = 160
-                        let x = min(max(8, bounds.midX - width / 2), max(8, geometry.size.width - width - 8))
-                        let y = min(bounds.maxY + 8, max(8, geometry.size.height - height - 8))
-                        dayDetails(target.date)
-                            .frame(width: width, height: height)
-                            .nativeHoverSurface()
-                            .offset(x: x, y: y)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-                    }
+                if let hoveredDate {
+                    Text("\(plural(shown.requests, "request")) · all devices")
+                    Spacer()
+                    Text(hoveredDate.formatted(.dateTime.day().month(.abbreviated).year()))
+                } else {
+                    Text("All accounts · \(plural(report.deviceCount, "device"))")
+                    if !report.staleDevices.isEmpty { Text("· cached / incomplete").help("History unavailable or stale on: " + report.staleDevices.joined(separator: ", ")) }
+                    if report.unreadable > 0 { Image(systemName: "exclamationmark.triangle").help("Some history records or files could not be read. Totals may be incomplete.") }
+                    if report.cacheFailure { Image(systemName: "externaldrive.badge.exclamationmark").help("History was read but its cache could not be saved.") }
+                    Spacer()
+                    if report.loaded { Text(chartCaption) }
                 }
             }
-            .onChange(of: period) { _, _ in hoveredDate = nil }
-            .onDisappear { hoveredDate = nil }
+            .font(.system(size: 10)).foregroundStyle(Palette.secondary).monospacedDigit()
+        }
+        .padding(12)
+        .onChange(of: period) { _, _ in hoveredDate = nil }
+        .onDisappear { hoveredDate = nil }
+    }
+
+    private func exactDescription(_ totals: TokenTotals) -> String {
+        "Total \(totals.total.formatted()) tokens\nInput \(totals.input.formatted()) · Output \(totals.output.formatted())\n" +
+            "Cache read \(totals.cacheRead.formatted()) · Cache write \(totals.cacheWrite.formatted())\n\(plural(totals.requests, "unique request"))"
     }
 
     private var chartCaption: String {
-        guard period != .all else { return "Daily activity · past year" }
+        guard period != .all else { return "Past year" }
         let start = period.start().formatted(.dateTime.month(.abbreviated).day())
         let end = Date().formatted(.dateTime.month(.abbreviated).day())
-        return "Daily activity · \(start) – \(end)"
+        return "\(start) – \(end)"
     }
 
     private func tokenBreakdown(_ totals: TokenTotals) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .top, spacing: 12) {
-                tokenMetric("Input", value: totals.input)
-                tokenMetric("Output", value: totals.output)
-                tokenMetric("Cached", value: totals.cacheRead + totals.cacheWrite)
-            }
-            HStack(spacing: 5) {
-                Text("Cache read \(Self.tokens(totals.cacheRead))")
-                Text("·")
-                Text("Cache write \(Self.tokens(totals.cacheWrite))")
-            }.font(.system(size: 9)).foregroundStyle(.secondary)
-                .help("Cached = reads + writes. Total tokens = input + output + cached.")
+        HStack(alignment: .top, spacing: 8) {
+            tokenMetric("Input", value: totals.input)
+            tokenMetric("Output", value: totals.output)
+            tokenMetric("Cache read", value: totals.cacheRead)
+            tokenMetric("Cache write", value: totals.cacheWrite)
         }
+        .padding(.top, 10)
+        .overlay(alignment: .top) { Rectangle().fill(Palette.divider).frame(height: 1) }
+        .help("Total tokens = input + output + cache reads + cache writes.")
     }
 
     private func tokenMetric(_ title: String, value: Int64) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.system(size: 9)).foregroundStyle(.secondary)
-            Text(Self.tokens(value)).font(.system(size: 11, weight: .medium)).monospacedDigit()
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title).font(.system(size: 10)).foregroundStyle(Palette.secondary).lineLimit(1)
+            Text(Self.tokens(value)).font(.system(size: 12, weight: .semibold)).monospacedDigit()
         }.frame(maxWidth: .infinity, alignment: .leading)
             .help("\(title): \(value.formatted()) tokens")
     }
@@ -102,34 +134,38 @@ struct HistoryView: View {
         let today = calendar.startOfDay(for: Date())
         let dates = (0..<days).map { calendar.date(byAdding: .day, value: $0 - days + 1, to: today)! }
         let maximum = max(1, dates.map { report.days[$0]?.total ?? 0 }.max() ?? 1)
-        let spacing: CGFloat = days == 7 ? 8 : 3
-        return VStack(spacing: 5) {
-            HStack(alignment: .bottom, spacing: spacing) {
+        // Columns touch so the pointer never falls between two days.
+        let gap: CGFloat = days == 7 ? 6 : 2
+        return VStack(spacing: 4) {
+            HStack(alignment: .bottom, spacing: 0) {
                 ForEach(dates, id: \.self) { date in
                     let total = report.days[date]?.total ?? 0
-                    let height = total == 0 ? 2 : max(3, 62 * CGFloat(total) / CGFloat(maximum))
-                    RoundedRectangle(cornerRadius: days == 7 ? 3 : 1)
-                        .fill(total > 0 ? Color.accentColor : Color.primary.opacity(0.08))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: days == 7 ? 3 : 1)
-                                .strokeBorder(.primary.opacity(hoveredDate == date ? 0.65 : 0), lineWidth: 1)
-                        }
+                    let height = total == 0 ? 2 : max(3, 48 * CGFloat(total) / CGFloat(maximum))
+                    let emphasis = hoveredDate.map { $0 == date } ?? (date == today)
+                    RoundedRectangle(cornerRadius: days == 7 ? 3 : 1.5, style: .continuous)
+                        .fill(total > 0 ? Palette.accent.opacity(emphasis ? 1 : 0.4) : Palette.track)
                         .frame(maxWidth: .infinity)
                         .frame(height: height)
-                        .frame(height: 62, alignment: .bottom)
+                        .padding(.horizontal, gap / 2)
+                        .frame(height: 48, alignment: .bottom)
                         .modifier(HistoryDayHover(date: date, hoveredDate: $hoveredDate))
                         .accessibilityLabel(dayDescription(date))
                 }
             }
-            HStack(spacing: spacing) {
+            HStack(spacing: 0) {
                 ForEach(Array(dates.enumerated()), id: \.offset) { index, date in
-                    let label = days == 7 ? date.formatted(.dateTime.weekday(.abbreviated)) :
+                    let label = days == 7 ? (date == today ? "Today" : date.formatted(.dateTime.weekday(.abbreviated))) :
                         (index % 5 == 0 || index == days - 1 ? date.formatted(.dateTime.day()) : "")
-                    Text(label).frame(maxWidth: .infinity)
+                    let selected = hoveredDate.map { $0 == date } ?? (date == today)
+                    Text(label).fontWeight(selected ? .semibold : .regular)
+                        .foregroundStyle(selected ? Color.primary : Palette.secondary)
+                        .fixedSize().frame(maxWidth: .infinity).padding(.horizontal, gap / 2)
                 }
-            }.font(.system(size: 8)).foregroundStyle(.secondary).monospacedDigit()
+            }.font(.system(size: 10)).monospacedDigit()
                 .accessibilityHidden(true)
-        }.frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, -gap / 2)
+        .frame(maxWidth: .infinity)
     }
 
     private func dayDescription(_ date: Date) -> String {
@@ -138,31 +174,6 @@ struct HistoryView: View {
             "Input \(totals.input.formatted()) · Output \(totals.output.formatted())\n" +
             "Cache read \(totals.cacheRead.formatted()) · Cache write \(totals.cacheWrite.formatted())\n" +
             "Estimated API cost \(cost(totals)) · \(totals.requests.formatted()) requests"
-    }
-
-    private func dayDetails(_ date: Date) -> some View {
-        let totals = report.days[date] ?? TokenTotals()
-        return VStack(alignment: .leading, spacing: 5) {
-            Text(date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year()))
-                .font(.system(size: 11, weight: .semibold))
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                detailRow("Total tokens", value: totals.total.formatted(), prominent: true)
-                detailRow("Input", value: totals.input.formatted())
-                detailRow("Output", value: totals.output.formatted())
-                detailRow("Cache read", value: totals.cacheRead.formatted())
-                detailRow("Cache write", value: totals.cacheWrite.formatted())
-                detailRow(totals.unknownModels.isEmpty ? "Est. API cost" : "Partial API estimate", value: cost(totals))
-            }.font(.system(size: 10))
-            Text("\(totals.requests.formatted()) requests · all devices")
-                .font(.system(size: 9)).foregroundStyle(.secondary)
-        }.padding(10)
-    }
-
-    private func detailRow(_ label: String, value: String, prominent: Bool = false) -> some View {
-        GridRow {
-            Text(label).foregroundStyle(prominent ? .primary : .secondary)
-            Text(value).monospacedDigit().gridColumnAlignment(.trailing)
-        }.fontWeight(prominent ? .medium : .regular)
     }
 
     private var activityGrid: some View {
@@ -180,7 +191,7 @@ struct HistoryView: View {
                         let tokens = report.days[date]?.total ?? 0
                         let level = tokens > 0 ? 0.25 + 0.75 * log1p(Double(tokens)) / log1p(Double(maximum)) : 0
                         RoundedRectangle(cornerRadius: 1)
-                            .fill(tokens > 0 ? Color.accentColor.opacity(level) : Color.primary.opacity(0.08))
+                            .fill(tokens > 0 ? Palette.accent.opacity(level) : Palette.track)
                             .overlay {
                                 RoundedRectangle(cornerRadius: 1)
                                     .strokeBorder(.primary.opacity(hoveredDate == date ? 0.8 : 0), lineWidth: 1)
@@ -224,19 +235,6 @@ struct HistoryView: View {
     }
 }
 
-private struct HistoryHoverTarget {
-    let date: Date
-    let bounds: Anchor<CGRect>
-}
-
-private struct HistoryHoverPreference: PreferenceKey {
-    static var defaultValue: HistoryHoverTarget? { nil }
-
-    static func reduce(value: inout HistoryHoverTarget?, nextValue: () -> HistoryHoverTarget?) {
-        value = nextValue() ?? value
-    }
-}
-
 private struct HistoryDayHover: ViewModifier {
     let date: Date
     @Binding var hoveredDate: Date?
@@ -245,10 +243,44 @@ private struct HistoryDayHover: ViewModifier {
         content.contentShape(Rectangle())
             .onHover { hovering in
                 if hovering { hoveredDate = date }
-                else if hoveredDate == date { hoveredDate = nil }
+                else if hoveredDate == date {
+                    // Moving to a neighbouring day must not flash the period totals.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { if hoveredDate == date { hoveredDate = nil } }
+                }
             }
-            .anchorPreference(key: HistoryHoverPreference.self, value: .bounds) { bounds in
-                hoveredDate == date ? HistoryHoverTarget(date: date, bounds: bounds) : nil
+    }
+}
+
+private struct PeriodPicker: View {
+    @Binding var selection: HistoryPeriod
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(HistoryPeriod.allCases) { period in
+                let selected = period == selection
+                Button { selection = period } label: {
+                    Text(period.short).font(.system(size: 11, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? Color.primary : Palette.secondary)
+                        .padding(.horizontal, 9).padding(.vertical, 2)
+                        .background(selected ? Palette.card : .clear, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        .shadow(color: .black.opacity(selected ? 0.12 : 0), radius: 1, y: 0.5)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(period.rawValue)
+                .accessibilityAddTraits(selected ? .isSelected : [])
             }
+        }
+        .padding(2)
+        .background(Palette.fill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+private extension HistoryPeriod {
+    var short: String {
+        switch self {
+        case .week: return "7D"
+        case .month: return "30D"
+        case .all: return "All"
+        }
     }
 }

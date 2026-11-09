@@ -12,6 +12,13 @@ enum CswitchIcon {
         return image
     }
 
+    static func glyphImage(size: CGFloat, color: NSColor) -> NSImage {
+        NSImage(size: NSSize(width: size, height: size), flipped: false) { bounds in
+            drawGlyph(in: bounds, color: color)
+            return true
+        }
+    }
+
     static func drawAppIcon(in bounds: NSRect) {
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }

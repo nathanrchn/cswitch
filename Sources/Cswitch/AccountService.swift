@@ -3,6 +3,7 @@ import Foundation
 
 struct DeviceSelection: Codable {
     var identity: AccountIdentity?
+    var login: ClaudeLogin?
     var checkedAt: Date
 }
 
@@ -53,26 +54,17 @@ actor AccountService {
     func snapshot() -> AppData { data }
     func status(_ device: Device) throws -> DeviceStatus { try backend.status(device) }
 
-    func inspectDevices() async -> [DeviceOutcome] {
-        let devices = data.devices, backend = self.backend
-        let result = await withTaskGroup(of: DeviceOutcome.self) { group in
-            for device in devices {
-                group.addTask {
-                    do { return DeviceOutcome(device: device, status: try backend.status(device)) }
-                    catch { return DeviceOutcome(device: device, failure: error.localizedDescription) }
-                }
-            }
-            var result: [DeviceOutcome] = []
-            for await outcome in group { result.append(outcome) }
-            return result
-        }
-        rememberSelections(result)
-        // A read-only inspection still succeeds if its display cache cannot be saved.
-        try? persist()
-        return result
+    /// Read-only and independent of the actor, so devices report as they answer.
+    nonisolated func probe(_ device: Device) -> DeviceOutcome {
+        do { return DeviceOutcome(device: device, status: try backend.status(device)) }
+        catch { return DeviceOutcome(device: device, failure: error.localizedDescription) }
     }
 
-    func select(_ device: Device) throws { data.selectedDeviceID = device.id; try persist() }
+    func remember(_ outcomes: [DeviceOutcome]) {
+        rememberSelections(outcomes)
+        // A read-only inspection still succeeds if its display cache cannot be saved.
+        try? persist()
+    }
 
     func addDevice(name: String, host: String) throws -> Device {
         guard Device.validHost(host) else { throw CswitchError.message("Enter an SSH alias or user@hostname, without spaces or command-line options.") }
@@ -87,8 +79,11 @@ actor AccountService {
     func importCurrent(on device: Device, label: String) async throws -> SavedAccount {
         let capture = try backend.capture(device, interactive: true)
         guard let secret = capture.secret else { throw CswitchError.message("Sign in to Claude Code on one device first, then save the account here.") }
-        try await network.verify(secret)
-        return try save(secret, device: device, label: label)
+        // Resolve the actual token owner: Claude's configured labels may still
+        // name another account after a previous file-only Mac switch.
+        let verified = device.sshHost == nil ? try await network.identified(secret) : secret
+        if device.sshHost != nil { try await network.verify(verified) }
+        return try save(verified, device: device, label: label)
     }
 
     func finishLogin(code: String, verifier: String, state: String, label: String) async throws -> SavedAccount {
@@ -113,7 +108,8 @@ actor AccountService {
         try persist()
     }
 
-    func switchEverywhere(_ account: SavedAccount, force: Bool = false) async throws -> SwitchReport {
+    func switchEverywhere(_ account: SavedAccount, force: Bool = false,
+                          progress: @escaping @Sendable (DeviceOutcome) -> Void = { _ in }) async throws -> SwitchReport {
         let devices = data.devices, backend = self.backend
         // Read every target first. Preserve outgoing token generations and choose
         // one verified target login before any device's credential is replaced.
@@ -135,15 +131,19 @@ actor AccountService {
             }
             return (ready, failed)
         }
+        preparation.1.forEach(progress)
         guard !preparation.0.isEmpty else { return SwitchReport(outcomes: preparation.1) }
         for prepared in preparation.0 {
             if let secret = prepared.capture.secret {
-                // A Mac CLI may have changed oauthAccount while leaving an old
-                // fallback token in place. Never save that mismatched pair over
-                // a good account backup. Expired outgoing logins need no renewal.
-                do { try await network.verify(secret) }
-                catch { continue }
-                _ = try save(secret, device: prepared.device, label: "")
+                // Preserve the actual outgoing Keychain login even if stale
+                // config labels name another account. Never pair an unverified
+                // token with those labels or overwrite a good saved backup.
+                let outgoing: AccountSecret
+                do {
+                    outgoing = prepared.device.sshHost == nil ? try await network.identified(secret) : secret
+                    if prepared.device.sshHost != nil { try await network.verify(outgoing) }
+                } catch { continue }
+                _ = try save(outgoing, device: prepared.device, label: "")
             }
         }
         guard var target = try savedSecret(account, interactive: true) else {
@@ -163,20 +163,24 @@ actor AccountService {
             for prepared in preparation.0 {
                 group.addTask {
                     do {
-                        if force || prepared.status.identity?.matches(account.identity) != true ||
-                            prepared.capture.secret?.accessToken != verifiedTarget.accessToken {
+                        if force || prepared.device.sshHost == nil || prepared.status.identity?.matches(account.identity) != true ||
+                            prepared.capture.secret != verifiedTarget {
                             try backend.activate(verifiedTarget, on: prepared.device, expected: prepared.capture.fingerprint)
                         }
                         let status = try backend.status(prepared.device)
                         guard status.identity?.matches(account.identity) == true else {
                             throw CswitchError.message("The credential files did not confirm the selected account.")
                         }
+                        if let login = status.login,
+                           !login.matches(account.identity, plan: verifiedTarget.oauth["subscriptionType"]?.string) {
+                            throw CswitchError.message("Claude Code still reports a different login or subscription. Check shell authentication overrides and restart Claude Code.")
+                        }
                         return DeviceOutcome(device: prepared.device, status: status)
                     } catch { return DeviceOutcome(device: prepared.device, failure: error.localizedDescription) }
                 }
             }
             var result: [DeviceOutcome] = []
-            for await outcome in group { result.append(outcome) }
+            for await outcome in group { result.append(outcome); progress(outcome) }
             return result
         }
         let outcomes = preparation.1 + applied
@@ -195,24 +199,22 @@ actor AccountService {
         if let next = nextUsageAttempt[account.id], next > Date() {
             throw CswitchError.message("Usage is temporarily rate limited. Try again after \(next.formatted(date: .omitted, time: .shortened)).")
         }
-        let value: AccountSecret
-        let active = status?.identity?.matches(account.identity) == true
-        if active {
-            let current = try backend.capture(device, interactive: interactive)
-            guard let secret = current.secret, try secret.account.matches(account.identity) else {
-                throw CswitchError.message("The device changed accounts. Refresh its status.")
-            }
-            try await network.verify(secret)
+        // Read Keychain without UI during refresh; permission is requested only
+        // by an explicit import or switch. Failed reads leave saved usage usable.
+        if status?.identity?.matches(account.identity) == true,
+           let secret = try? backend.capture(device, interactive: false).secret,
+           (try? secret.account.matches(account.identity)) == true,
+           (try? await network.verify(secret)) != nil {
             _ = try save(secret, device: device, label: "", interactive: interactive)
-            // Another device may already have renewed a newer generation of this login.
-            value = try await usableSecret(account, on: device, status: status, interactive: interactive, discover: false)
-        } else {
-            value = try await usableSecret(account, on: device, status: status, interactive: interactive, discover: false)
         }
+        // Another device may already have renewed a newer generation of this login.
+        let value = try await usableSecret(account, on: device, status: status, interactive: false, discover: false)
         do {
             let usage = try await network.usage(value.accessToken)
             if let index = data.accounts.firstIndex(where: { $0.id == account.id }) {
-                data.accounts[index].usage = usage; try persist()
+                data.accounts[index].usage = usage
+                if let plan = value.oauth["subscriptionType"]?.string { data.accounts[index].plan = plan }
+                try persist()
             }
             nextUsageAttempt[account.id] = nil
             return usage
@@ -229,6 +231,7 @@ actor AccountService {
         let existing = data.accounts.firstIndex { $0.identity.matches(identity) }
         var account = existing.map { data.accounts[$0] } ?? SavedAccount(deviceID: device.id, label: identity.email, identity: identity)
         if !label.isEmpty { account.label = label }
+        if let plan = value.oauth["subscriptionType"]?.string { account.plan = plan }
         account.sharedDeviceIDs = Array(Set(account.knownDeviceIDs + [device.id])).sorted()
         // A stale replica must not replace a newer credential already held in the vault.
         if let old = try savedSecret(account, interactive: interactive), generation(old) > generation(value) {
@@ -295,7 +298,7 @@ actor AccountService {
             newest = try await network.renew(newest)
             try writeSecret(newest, id: account.id)
         }
-        // Claude owns renewal of selected file logins on both Mac and Linux.
+        // Claude owns renewal of selected Keychain/file logins.
         // Usage refresh may save a newer backup but must never rewrite the Mac's
         // selected credential files or settings as a background side effect.
         return newest
@@ -309,7 +312,7 @@ actor AccountService {
         var selections = data.deviceSelections ?? [:]
         for outcome in outcomes {
             guard let status = outcome.status else { continue }
-            selections[outcome.device.id] = DeviceSelection(identity: status.configuredIdentity, checkedAt: Date())
+            selections[outcome.device.id] = DeviceSelection(identity: status.configuredIdentity, login: status.login, checkedAt: Date())
         }
         data.deviceSelections = selections
     }
@@ -381,6 +384,19 @@ final class ClaudeAPI {
         if let organization = profile["organization"]?["uuid"]?.string, let expectedOrg = expected.organization, organization != expectedOrg {
             throw CswitchError.message("Claude's credential belongs to a different organization. Sign in and save this account again.")
         }
+    }
+
+    func identified(_ secret: AccountSecret) async throws -> AccountSecret {
+        let bytes = try await request("https://api.anthropic.com/api/oauth/profile", token: secret.accessToken)
+        let profile = try JSONValue.decode(bytes)
+        guard let uuid = profile["account"]?["uuid"]?.string, !uuid.isEmpty,
+              let email = profile["account"]?["email"]?.string ?? profile["account"]?["email_address"]?.string, !email.isEmpty else {
+            throw CswitchError.message("Claude did not confirm the active credential's account. No saved login was replaced.")
+        }
+        var identity: [String: JSONValue] = ["accountUuid": .string(uuid), "emailAddress": .string(email)]
+        if let org = profile["organization"]?["uuid"]?.string { identity["organizationUuid"] = .string(org) }
+        if let name = profile["organization"]?["name"]?.string { identity["organizationName"] = .string(name) }
+        return try AccountSecret(oauth: secret.oauth, identity: .object(identity))
     }
 
     func renew(_ secret: AccountSecret) async throws -> AccountSecret {

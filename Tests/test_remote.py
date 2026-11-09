@@ -43,11 +43,44 @@ class RemoteTests(unittest.TestCase):
         status = remote.run({"operation": "status"})
         self.assertEqual(status["identity"], self.old_identity)
 
+    def test_status_reports_claude_login_without_tokens(self):
+        executable = self.root / ".local/bin/claude"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\n"
+            "case \"$*\" in\n"
+            "  --version) echo '2.1.303 (Claude Code)';;\n"
+            "  'auth status --help') echo 'Usage: claude auth status [options]';;\n"
+            "  'auth status --json') echo '{\"loggedIn\": true, \"authMethod\": \"claude.ai\", \"email\": \"new@example.com\", \"orgId\": \"org\", \"token\": \"secret\"}';;\n"
+            "esac\n")
+        executable.chmod(0o700)
+        status = remote.run({"operation": "status"})
+        self.assertEqual(status["version"], "2.1.303")
+        self.assertEqual(status["login"], {"loggedIn": True, "authMethod": "claude.ai", "email": "new@example.com", "orgId": "org"})
+
+    def test_status_skips_claude_without_auth_command(self):
+        executable = self.root / ".local/bin/claude"
+        executable.parent.mkdir(parents=True)
+        marker = self.root / "prompted"
+        executable.write_text("#!/bin/sh\n"
+            "case \"$*\" in\n"
+            "  --version) echo '1.0.0 (Claude Code)';;\n"
+            "  *--help) echo 'Usage: claude [options] [prompt]';;\n"
+            f"  *) touch '{marker}';;\n"
+            "esac\n")
+        executable.chmod(0o700)
+        status = remote.run({"operation": "status"})
+        self.assertIsNone(status["login"])
+        self.assertFalse(marker.exists())
+
     def test_switch_preserves_shared_state_and_permissions(self):
+        config = json.loads(self.config.read_text())
+        config["cachedUsageUtilization"] = {"accountUuid": "old", "utilization": 100}
+        self.config.write_text(json.dumps(config))
         capture = remote.run({"operation": "capture"})
         remote.run({"operation": "activate", "secret": self.target, "expectedFingerprint": capture["fingerprint"]})
         self.assertEqual(json.loads(self.config.read_text())["projects"], {"work": {"trusted": True}})
         self.assertIn("github", json.loads(self.config.read_text())["mcpServers"])
+        self.assertNotIn("cachedUsageUtilization", json.loads(self.config.read_text()))
         credentials = json.loads(self.credentials.read_text())
         self.assertEqual(credentials["mcpOAuth"], {"github": "preserve"})
         self.assertEqual(credentials["claudeAiOauth"], self.target["oauth"])

@@ -109,3 +109,43 @@ private func json(_ source: String) throws -> JSONValue { try .decode(Data(sourc
     let b = try AccountIdentity(json: json(#"{"accountUuid":"same","emailAddress":"a@example.com","organizationUuid":"two"}"#))
     #expect(!a.matches(b))
 }
+
+@Test func claudeAuthStatusKeepsOnlyAccountMetadata() throws {
+    let login = try #require(ClaudeLogin(status: json(#"{"loggedIn":true,"authMethod":"claude.ai","email":"a@example.com","orgId":"one","orgName":"Org","subscriptionType":"max","accessToken":"secret"}"#)))
+    #expect(login == ClaudeLogin(loggedIn: true, method: "claude.ai", email: "a@example.com", organization: "one", organizationName: "Org", plan: "max"))
+    #expect(ClaudeLogin(status: try json(#"{"email":"a@example.com"}"#)) == nil)
+}
+
+@Test func deviceAccountPrefersClaudeLoginOverConfiguredFiles() throws {
+    let personal = SavedAccount(id: "p", deviceID: "local", label: "Personal", identity: try AccountIdentity(json: json(#"{"accountUuid":"1","emailAddress":"a@example.com","organizationUuid":"one"}"#)))
+    let team = SavedAccount(id: "t", deviceID: "local", label: "Team", identity: try AccountIdentity(json: json(#"{"accountUuid":"1","emailAddress":"a@example.com","organizationUuid":"two"}"#)))
+    let accounts = [personal, team]
+    let keychain = ClaudeLogin(loggedIn: true, email: "A@example.com", organization: "two")
+    #expect(DeviceAccount.resolve(login: keychain, configured: personal.identity, accounts: accounts) == .saved("t"))
+    #expect(DeviceAccount.resolve(login: nil, configured: personal.identity, accounts: accounts) == .saved("p"))
+    let other = ClaudeLogin(loggedIn: true, email: "new@example.com", organizationName: "Lab", plan: "team")
+    #expect(DeviceAccount.resolve(login: other, configured: nil, accounts: accounts) == .unsaved(email: "new@example.com", organizationName: "Lab", plan: "team"))
+    #expect(DeviceAccount.resolve(login: ClaudeLogin(loggedIn: false), configured: personal.identity, accounts: accounts) == .signedOut)
+    #expect(DeviceAccount.resolve(login: ClaudeLogin(loggedIn: true, method: "api_key"), configured: nil, accounts: accounts) == .other("API key"))
+    #expect(DeviceAccount.resolve(login: nil, configured: nil, accounts: accounts) == .unknown)
+}
+
+@Test func keychainLoginThatDiffersFromFilesIsReported() throws {
+    let files = try AccountIdentity(json: json(#"{"accountUuid":"1","emailAddress":"a@example.com","organizationUuid":"one"}"#))
+    #expect(DeviceStatus(identity: files, login: ClaudeLogin(loggedIn: true, email: "b@example.com")).loginOverridesFiles)
+    #expect(!DeviceStatus(identity: files, login: ClaudeLogin(loggedIn: true, email: "a@example.com", organization: "one")).loginOverridesFiles)
+    #expect(!DeviceStatus(identity: files).loginOverridesFiles)
+}
+
+@Test func matchingLabelsWithDifferentCredentialPlanDoNotClaimSync() throws {
+    let identity = try AccountIdentity(json: json(#"{"accountUuid":"1","emailAddress":"work@example.com","organizationUuid":"org"}"#))
+    var saved = SavedAccount(id: "work", deviceID: "local", label: "Work", identity: identity)
+    saved.plan = "claude_team"
+    let stale = ClaudeLogin(loggedIn: true, email: identity.email, organization: "org", plan: "max")
+    #expect(!stale.matches(identity, plan: saved.plan))
+    #expect(DeviceAccount.resolve(login: stale, configured: identity, accounts: [saved]).savedID == nil)
+    #expect(DeviceStatus(identity: identity, login: stale, configuredPlan: saved.plan).loginOverridesFiles)
+    let correct = ClaudeLogin(loggedIn: true, email: identity.email, organization: "org", plan: "team")
+    #expect(correct.matches(identity, plan: saved.plan))
+    #expect(DeviceAccount.resolve(login: correct, configured: identity, accounts: [saved]) == .saved("work"))
+}
